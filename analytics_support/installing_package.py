@@ -19,7 +19,3 @@ def install_package(package):
         except Exception as e:
             print(f"예기치 못한 오류가 발생했습니다: {str(e)}.")
 
-
-install_package('influxdb_client')
-install_package('pycaret')
-install_package('pyyaml')

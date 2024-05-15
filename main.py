@@ -1,18 +1,26 @@
+import os
 import sys
 import pytz
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from pycaret.time_series import TSForecastingExperiment
 from analytics_support.config_loader import load_config
 from analytics_support.database import InfluxDBManager
 from analytics_support.data_processing import resampling_data, replace_iqr_outliers, merge_dataframes
+from analytics_support.installing_package import install_package
 
 
 # 상수 정의
+PACKAGE_LIST = ['influxdb_client', 'pycaret', 'pyyaml', 'prophet']
 CONFIG_PATH = "resources/influxdb_config.yaml"
 CSV_PATH = "resources/training_data/sensor_data.csv"
 DEFAULT_START_DATE = "2024-04-17"
 KOREA_TZ = pytz.timezone("Asia/Seoul")
+TARGET = "socket_power(Wh)"
+MODEL_PATH = "resources/model/final_model"
+
+os.environ["PYCARET_CUSTOM_LOGGING_LEVEL"] = "CRITICAL"
 
 
 def check_to_start_date(file_path: str) -> datetime:
@@ -86,14 +94,6 @@ def update_csv(csv_path, new_data):
 start_time_utc = check_to_start_date(CSV_PATH)
 end_time_utc = check_to_end_date(KOREA_TZ)
 
-print("조회 날짜 확인 (UTC):", start_time_utc.date(), "~", end_time_utc.date())
-
-if start_time_utc.date() == end_time_utc.date():
-    print("CSV가 최신버전 입니다.")
-    sys.exit(1)
-
-print("CSV를 최신화 합니다.")
-
 # 콘센트 전력(W) 조회
 query_power_socket_data = f'''
 import "experimental"
@@ -139,8 +139,26 @@ flux_queries = {
 }
 
 
-def main():
+def install():
     try:
+        for package in PACKAGE_LIST:
+            install_package(package)
+
+    except Exception as e:
+        print(f"패키지 설치 문제 발생: {e}")
+        sys.exit(1)
+
+
+def dataring():
+    try:
+        print("조회 날짜 확인 (UTC):", start_time_utc.date(), "~", end_time_utc.date())
+
+        if start_time_utc.date() == end_time_utc.date():
+            print("CSV가 최신버전 입니다.")
+            return
+
+        print("CSV를 최신화 합니다.")
+
         # 설정 로드
         config = load_config(CONFIG_PATH)
 
@@ -174,5 +192,42 @@ def main():
         sys.exit(1)
 
 
+def modeling():
+    try:
+        print("학습 데이터 로드")
+        training_data = pd.read_csv(CSV_PATH)
+
+        training_data["time"] = pd.to_datetime(training_data["time"])
+
+        exp_exo = TSForecastingExperiment()
+
+        print("모델링 시작")
+        exp_exo.setup(
+            data=training_data,
+            target=TARGET,
+            index="time",
+            fh=24,
+            session_id=42,
+            verbose=False
+        )
+        model_exo = exp_exo.create_model(
+            "arima",
+            order=(0, 1, 2),
+            seasonal_order=(0, 1, 1, 24),
+        )
+
+        # Finalize Model : 전체 데이터를 활용한 재학습
+        final_model = exp_exo.finalize_model(model_exo)
+        print("모델 구현 완료")
+
+        exp_exo.save_model(final_model, MODEL_PATH)
+
+    except Exception as e:
+        print(f"모델링 실패: {e}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    install()
+    dataring()
+    modeling()

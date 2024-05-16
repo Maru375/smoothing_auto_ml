@@ -1,4 +1,5 @@
 import yaml
+import logging
 
 
 def load_config(yaml_file_path: str) -> dict:
@@ -9,8 +10,8 @@ def load_config(yaml_file_path: str) -> dict:
     """
     try:
         with open(yaml_file_path, "r") as file:
-            print("설정 파일 로드 성공")
+            logging.info("설정 파일 로드 성공")
             return yaml.safe_load(file)
     except FileNotFoundError as e:
-        print(f"설정 파일을 찾을 수 없습니다: {e.filename}")
+        logging.error(f"설정 파일을 찾을 수 없습니다: {e.filename}")
         raise

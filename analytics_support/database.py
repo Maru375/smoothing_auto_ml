@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 from typing import Dict
 from influxdb_client import InfluxDBClient
@@ -38,10 +39,10 @@ class InfluxDBManager:
             df["time"] = df["time"].astype(str).str.replace(r"\+00:00$", "", regex=True)
             dataframes[key] = df
 
-        print("데이터 조회 완료")
+        logging.info("데이터 조회 완료")
 
         return dataframes
 
     def close(self):
-        print("InfluxDBClient 정상 종료")
+        logging.info("InfluxDBClient 정상 종료")
         self.client.close()

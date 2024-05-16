@@ -1,14 +1,16 @@
-import os
 import sys
 import pytz
+import logging
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from pycaret.time_series import TSForecastingExperiment
-from analytics_support.config_loader import load_config
+
+from analytics_support.logging import setup_logging
 from analytics_support.database import InfluxDBManager
-from analytics_support.data_processing import resampling_data, replace_iqr_outliers, merge_dataframes
+from analytics_support.config_loader import load_config
 from analytics_support.installing_package import install_package
+from analytics_support.data_management import training_data_patch
+from analytics_support.modeling import modeling, generate_predictions
 
 
 # 상수 정의
@@ -19,8 +21,7 @@ DEFAULT_START_DATE = "2024-04-17"
 KOREA_TZ = pytz.timezone("Asia/Seoul")
 TARGET = "socket_power(Wh)"
 MODEL_PATH = "resources/model/final_model"
-
-os.environ["PYCARET_CUSTOM_LOGGING_LEVEL"] = "CRITICAL"
+EXOG_VARS = ['average_co2(ppm)', 'average_illumination(lux)']
 
 
 def check_to_start_date(file_path: str) -> datetime:
@@ -36,8 +37,6 @@ def check_to_start_date(file_path: str) -> datetime:
 
     # 파일 존재 여부 확인
     if not path.exists():
-        print(f" {file_path} 에서 CSV를 찾을 수 없습니다.")
-        print("시작 날짜를 Default로 설정합니다.")
         # 문자열에서 datetime 객체로 변환하고, 시간대를 지정
         start_time_kst = KOREA_TZ.localize(datetime.strptime(DEFAULT_START_DATE, "%Y-%m-%d"))
         return start_time_kst.astimezone(pytz.utc)
@@ -49,8 +48,8 @@ def check_to_start_date(file_path: str) -> datetime:
         last_date_kst = pd.to_datetime(last_date).tz_localize(KOREA_TZ)
         return last_date_kst.astimezone(pytz.utc)
     except Exception as e:
-        print(f"에러 발생: {e}")
-        return sys.exit(1)
+        logging.info(f"에러 발생: {e}")
+        sys.exit(1)
 
 
 def check_to_end_date(timezone: pytz.timezone) -> datetime:
@@ -63,32 +62,7 @@ def check_to_end_date(timezone: pytz.timezone) -> datetime:
 
     end_time_kst = KOREA_TZ.localize(datetime(today_kst.year, today_kst.month, today_kst.day, 0, 0, 0))
 
-    end_time_utc = end_time_kst.astimezone(pytz.utc)
-
-    return end_time_utc
-
-
-def update_csv(csv_path, new_data):
-    """
-    기존 CSV 파일을 업데이트합니다.
-    :param csv_path: 업데이트할 CSV 파일의 경로
-    :param new_data: 새로 추가할 데이터 (DataFrame 형식)
-    """
-    # 기존 데이터 로드, `_time`을 인덱스로 설정
-    if Path(csv_path).exists():
-        existing_data = pd.read_csv(csv_path, index_col='time', parse_dates=True)
-    else:
-        existing_data = pd.DataFrame()
-
-    # 새 데이터와 기존 데이터 병합
-    updated_data = pd.concat([existing_data, new_data], axis=0)
-
-    # 중복 인덱스 제거, 최신 데이터 유지
-    updated_data = updated_data[~updated_data.index.duplicated(keep='last')]
-
-    # 파일에 저장
-    updated_data.to_csv(csv_path)
-    print("CSV 파일이 업데이트 되었습니다.")
+    return end_time_kst.astimezone(pytz.utc)
 
 
 start_time_utc = check_to_start_date(CSV_PATH)
@@ -139,95 +113,39 @@ flux_queries = {
 }
 
 
-def install():
+def main():
+    start_time = datetime.now()
     try:
+        logging.info("필요 패키지를 확인합니다.")
         for package in PACKAGE_LIST:
             install_package(package)
 
-    except Exception as e:
-        print(f"패키지 설치 문제 발생: {e}")
-        sys.exit(1)
+        logging.info("조회 날짜 확인 (UTC): %s ~ %s", start_time_utc.date(), end_time_utc.date())
+        if start_time_utc.date() != end_time_utc.date():
+            logging.info("CSV를 최신화 합니다.")
+            config = load_config(CONFIG_PATH)
 
+            db_manager = InfluxDBManager(config["smoothing_influxdb"])
+            dataframes = db_manager.queries_to_dataframes(flux_queries)
+            db_manager.close()
 
-def dataring():
-    try:
-        print("조회 날짜 확인 (UTC):", start_time_utc.date(), "~", end_time_utc.date())
+            training_data_patch(dataframes, CSV_PATH)
+        else:
+            logging.info("CSV가 최신버전 입니다.")
 
-        if start_time_utc.date() == end_time_utc.date():
-            print("CSV가 최신버전 입니다.")
-            return
+        modeling(MODEL_PATH, CSV_PATH, TARGET)
 
-        print("CSV를 최신화 합니다.")
-
-        # 설정 로드
-        config = load_config(CONFIG_PATH)
-
-        # DB 클라이언트 생성
-        db_manager = InfluxDBManager(config["smoothing_influxdb"])
-
-        # Flux 쿼리 실행
-        dataframes = db_manager.queries_to_dataframes(flux_queries)
-        db_manager.close()
-
-        # 데이터 전처리(집계)
-        power_socket_df = resampling_data(dataframes["PowerSocketData"], "socket_power(Wh)", "sum")
-        co2_df = resampling_data(dataframes["CO2Data"], "average_co2(ppm)")
-        illumination_df = resampling_data(dataframes["IlluminationData"], "average_illumination(lux)")
-        print("데이터 전처리 완료")
-
-        # 이상치 제거
-        power_socket_df = replace_iqr_outliers(power_socket_df)
-        co2_df = replace_iqr_outliers(co2_df)
-        illumination_df = replace_iqr_outliers(illumination_df)
-        print("데이터 이상치 제거 완료")
-
-        # 데이터 프레임 병합
-        training_set_df = merge_dataframes([power_socket_df, co2_df, illumination_df])
-
-        # CSV 최신화
-        update_csv(CSV_PATH, training_set_df)
+        generate_predictions(MODEL_PATH, CSV_PATH, EXOG_VARS)
 
     except Exception as e:
-        print(f"데이터 처리 실패: {e}")
+        logging.error(f"모델링 실패: {e}")
         sys.exit(1)
-
-
-def modeling():
-    try:
-        print("학습 데이터 로드")
-        training_data = pd.read_csv(CSV_PATH)
-
-        training_data["time"] = pd.to_datetime(training_data["time"])
-
-        exp_exo = TSForecastingExperiment()
-
-        print("모델링 시작")
-        exp_exo.setup(
-            data=training_data,
-            target=TARGET,
-            index="time",
-            fh=24,
-            session_id=42,
-            verbose=False
-        )
-        model_exo = exp_exo.create_model(
-            "arima",
-            order=(0, 1, 2),
-            seasonal_order=(0, 1, 1, 24),
-        )
-
-        # Finalize Model : 전체 데이터를 활용한 재학습
-        final_model = exp_exo.finalize_model(model_exo)
-        print("모델 구현 완료")
-
-        exp_exo.save_model(final_model, MODEL_PATH)
-
-    except Exception as e:
-        print(f"모델링 실패: {e}")
-        sys.exit(1)
+    finally:
+        end_time = datetime.now()
+        elapsed_time = end_time - start_time
+        logging.info(f"RunTime: {elapsed_time}")
 
 
 if __name__ == "__main__":
-    install()
-    dataring()
-    modeling()
+    setup_logging()
+    main()

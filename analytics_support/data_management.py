@@ -1,6 +1,8 @@
+import logging
 import pandas as pd
 import numpy as np
 from typing import List
+from pathlib import Path
 
 
 def resampling_data(df: pd.DataFrame, change_column_name: str, calculate: str = "not") -> pd.DataFrame:
@@ -58,6 +60,46 @@ def merge_dataframes(df_list: List[pd.DataFrame]) -> pd.DataFrame:
     for df in df_list[1:]:
         merged_df = pd.merge(merged_df, df, on="time", how="inner", validate="1:1")
 
-    print("데이터 병합 완료")
-
     return merged_df
+
+
+def update_csv(csv_path, new_data):
+    """
+    기존 CSV 파일을 업데이트합니다.
+    :param csv_path: 업데이트할 CSV 파일의 경로
+    :param new_data: 새로 추가할 데이터 (DataFrame 형식)
+    """
+    # 기존 데이터 로드, `_time`을 인덱스로 설정
+    if Path(csv_path).exists():
+        existing_data = pd.read_csv(csv_path, index_col='time', parse_dates=True)
+    else:
+        existing_data = pd.DataFrame()
+
+    # 새 데이터와 기존 데이터 병합
+    updated_data = pd.concat([existing_data, new_data], axis=0)
+
+    # 중복 인덱스 제거, 최신 데이터 유지
+    updated_data = updated_data[~updated_data.index.duplicated(keep='last')]
+
+    # 파일에 저장
+    updated_data.to_csv(csv_path)
+
+
+def training_data_patch(dataframes, csv_ptah):
+
+    # 데이터 전처리(집계)
+    power_socket_df = resampling_data(dataframes["PowerSocketData"], "socket_power(Wh)", "sum")
+    co2_df = resampling_data(dataframes["CO2Data"], "average_co2(ppm)")
+    illumination_df = resampling_data(dataframes["IlluminationData"], "average_illumination(lux)")
+    logging.info("데이터 전처리 완료")
+
+    # 이상치 제거
+    power_socket_df = replace_iqr_outliers(power_socket_df)
+    co2_df = replace_iqr_outliers(co2_df)
+    illumination_df = replace_iqr_outliers(illumination_df)
+    logging.info("데이터 이상치 제거 완료")
+
+    # CSV 최신화
+    training_set_df = merge_dataframes([power_socket_df, co2_df, illumination_df])
+    update_csv(csv_ptah, training_set_df)
+    logging.info("CSV 파일이 업데이트 되었습니다.")
